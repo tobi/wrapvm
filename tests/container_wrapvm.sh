@@ -37,7 +37,8 @@ agent-browser open "file://$page/ab.html" >/dev/null
 curl -fsS http://127.0.0.1:9222/json/list | jq -e '[.[].title] | index("agent-browser page")' >/dev/null
 ok 'agent-browser, with the default config, opens its page in the desktop Chrome'
 
-chrome="$(ps -eo args | grep -E '^/opt/google/chrome/chrome( |$)' | grep -v -- '--type=' | head -1)"
+# Google Chrome on amd64, Chromium on arm64.
+chrome="$(ps -eo args | grep -E '^(/opt/google/chrome/chrome|/usr/lib/chromium/chromium)( |$)' | grep -v -- '--type=' | head -1)"
 [ -n "$chrome" ]
 if unshare --user --map-root-user --pid --net --fork true 2>/dev/null; then
   case "$chrome" in *--no-sandbox*) echo "Chrome runs without its sandbox: $chrome" >&2; exit 1 ;; esac

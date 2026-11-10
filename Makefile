@@ -1,5 +1,10 @@
 CONTAINER_ENGINE ?= podman
 IMAGE ?= localhost/wrapvm:test
+# BASE_IMAGE overrides the Containerfile's base. On arm64 it is tobi/wrap's
+# Containerfile.arm64 build, since ghcr.io/tobi/wrap:latest is amd64-only:
+#   make test CONTAINER_ENGINE=docker BASE_IMAGE=wrap-arm64:local
+# --pull is dropped in that case: a locally built base is in no registry.
+BASE_IMAGE ?=
 
 .PHONY: image test image.tar check-engine
 
@@ -13,7 +18,8 @@ check-engine:
 	fi
 
 image: check-engine
-	$(CONTAINER_ENGINE) build --pull -t $(IMAGE) -f Containerfile .
+	$(CONTAINER_ENGINE) build $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE),--pull) \
+	  -t $(IMAGE) -f Containerfile .
 
 # wrap's desktop tests (tests/container_{mise,viewer,a11y,desktop}*, from
 # tobi/wrap), then what wrapvm adds. Needs egress; every container is disposable.

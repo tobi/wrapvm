@@ -1,0 +1,52 @@
+name: Test the image
+description: >
+  The same checks as `make test`: wrap's desktop tests, then what wrapvm adds.
+  Needs egress; every container it starts is disposable.
+
+inputs:
+  image:
+    description: image to test
+    required: false
+    default: localhost/wrapvm:test
+  engine:
+    description: container engine binary
+    required: false
+    default: docker
+
+runs:
+  using: composite
+  steps:
+    - name: Test mise and agent-browser
+      shell: bash
+      run: >-
+        ${{ inputs.engine }} run --rm
+        -v "${{ github.workspace }}/tests:/tests:ro"
+        "${{ inputs.image }}" bash /tests/container_mise.sh desktop
+
+    - name: Test the viewer, offline
+      shell: bash
+      run: >-
+        ${{ inputs.engine }} run --rm --network none -e MISE_OFFLINE=1
+        -v "${{ github.workspace }}/tests:/tests:ro"
+        "${{ inputs.image }}" bash /tests/container_viewer.sh
+
+    - name: Test both agent CLIs on a fresh HOME, offline
+      shell: bash
+      run: |
+        ${{ inputs.engine }} run --rm --network none "${{ inputs.image }}" \
+          sh -lc 'd=$(mktemp -d); HOME=$d agent-browser --version >/dev/null && HOME=$d agent-desktop version >/dev/null'
+
+    - name: Test accessibility (agent-desktop)
+      shell: bash
+      run: CONTAINER_ENGINE=${{ inputs.engine }} bash tests/container_a11y_run.sh "${{ inputs.image }}"
+
+    - name: Test a plain detached run (CDP, viewer, SIGTERM)
+      shell: bash
+      run: CONTAINER_ENGINE=${{ inputs.engine }} bash tests/container_desktop_run.sh "${{ inputs.image }}"
+
+    - name: Test what wrapvm adds (ffmpeg, agent-browser config, skills)
+      shell: bash
+      run: >-
+        ${{ inputs.engine }} run --rm
+        -v "${{ github.workspace }}/tests:/tests:ro"
+        "${{ inputs.image }}" bash -l /tests/container_wrapvm.sh
