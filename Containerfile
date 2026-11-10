@@ -18,6 +18,15 @@
 # and refuses other sites' pages. Chrome only binds CDP to 127.0.0.1:9222 (it
 # ignores --remote-debugging-address with a window), so a socat forwarder serves
 # it on all guest interfaces at :9223.
+#
+# Both architectures come out of this one file. On amd64 the shared browser is
+# Google Chrome from its .deb; on arm64 it is Arch Linux ARM's Chromium, because
+# Google publishes no linux-arm64 Chrome and the amd64 build cannot stand in for
+# it (under qemu-user Chrome dies with an internal SIGTRAP before CDP is up).
+# BuildKit's automatic TARGETARCH picks the branch, so `docker build .` on an
+# arm64 host and `buildx build --platform linux/arm64` both do the right thing;
+# on arm64 the base image is tobi/wrap's Containerfile.arm64 build (see
+# README), since ghcr.io/tobi/wrap:latest is amd64-only.
 ARG BASE_IMAGE=ghcr.io/tobi/wrap:latest
 
 # ---------------------------------------------------------------------------
@@ -32,7 +41,11 @@ FROM ${BASE_IMAGE} AS voxl
 # The base puts mise's shims first on PATH, and cargo there is a lazy install.
 # Arch's own rust is the toolchain here.
 ENV HOME=/root USER=root CARGO_HOME=/tmp/cargo PATH=/usr/bin:/bin
-RUN pacman -Syu --noconfirm --needed rust esbuild x264 libyuv opus libpulse \
+# --disable-sandbox: pacman 7.1 wraps its databases in a Landlock sandbox that
+# BuildKit's seccomp profile refuses ("restricting filesystem access failed"),
+# so every pacman call in this file passes it. Requires pacman >= 7.1, which
+# both wrap bases have.
+RUN pacman -Syu --disable-sandbox --noconfirm --needed rust esbuild x264 libyuv opus libpulse \
  && rm -rf /var/cache/pacman/pkg/*
 # Arch's libyuv ships no pkg-config file, and voxl's build.rs asks pkg-config
 # for every library it links.
@@ -70,6 +83,10 @@ RUN sed -i 's/^bindgen = "0.71"$/bindgen = "0.72"/' Cargo.toml \
 
 FROM ${BASE_IMAGE}
 
+# BuildKit's automatic platform arg, re-declared here because a global ARG is not
+# in scope inside a stage. Picks the browser install below (Chrome / Chromium).
+ARG TARGETARCH
+
 # Build steps run as root; keep root's droppings out of the user's home. The
 # runtime identity (HOME=/home/user) is restored at the end of the file.
 ENV HOME=/root USER=root
@@ -103,13 +120,13 @@ ENV DISPLAY=:1 \
 # wrapvm: pulseaudio is the desktop's sound card, a null sink that voxl streams
 # to the viewer; pulseaudio-alsa routes ALSA's default device into it.
 # ---------------------------------------------------------------------------
-RUN pacman -Syu --noconfirm --needed \
+RUN pacman -Syu --disable-sandbox --noconfirm --needed \
       xorg-server-xvfb xorg-xauth xorg-xdpyinfo xorg-xset xorg-xrandr xdotool \
       scrot socat x264 libyuv opus libpulse \
       dbus xfce4-session xfwm4 xfdesktop xfce4-panel xfce4-settings xfconf \
       xfce4-terminal thunar xfce4-appfinder garcon adwaita-icon-theme \
       ttf-dejavu ttf-liberation noto-fonts noto-fonts-emoji \
-      alsa-lib gtk3 libcups libxss libxtst nss xdg-utils at-spi2-core \
+      alsa-lib gtk3 libcups libxss libxtst nss xdg-utils at-spi2-core procps-ng \
       libxrandr libxcomposite libxdamage libxkbcommon libdrm mesa pango cairo \
       libxshmfence vulkan-icd-loader \
       ffmpeg pulseaudio pulseaudio-alsa \
@@ -208,24 +225,55 @@ COPY --from=voxl /opt/voxl/bin/voxl /usr/local/bin/voxl
 RUN LD_BIND_NOW=1 voxl --version
 
 # ---------------------------------------------------------------------------
-# Google Chrome stable, straight from Google's .deb (the AUR package does the
-# same thing). No dpkg needed: bsdtar unpacks data.tar.* onto /. Cron/apt
-# repo hooks from the package are dropped.
+# The shared browser, one install per architecture, both ending at the same
+# path: /usr/lib/wrap/browser, which every launcher below execs.
+#
+#  amd64 — Google Chrome stable, straight from Google's .deb (the AUR package
+#          does the same thing). No dpkg needed: bsdtar unpacks data.tar.* onto
+#          /. Cron/apt repo hooks from the package are dropped.
+#  arm64 — Arch Linux ARM's Chromium. Google ships no linux-arm64 Chrome, and
+#          the amd64 build dies under qemu-user emulation (internal SIGTRAP)
+#          before CDP is up, so emulating it is not an option. Chromium is the
+#          same engine: CDP, policies, initial_preferences and agent-browser's
+#          autoConnect work the same way. It has no Widevine and no Google
+#          auto-update, and its icon is aliased to google-chrome so the dock,
+#          the .desktop entry and XFCE's helper keep resolving.
 # ---------------------------------------------------------------------------
-RUN curl -fsSL -o /tmp/chrome.deb \
-      https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
- && bsdtar -xOf /tmp/chrome.deb 'data.tar.*' | bsdtar -x -C / \
- && rm -f /tmp/chrome.deb /etc/cron.daily/google-chrome \
- && rm -rf /opt/google/chrome/cron \
- && ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome-stable \
- && ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome \
- && chmod 4755 /opt/google/chrome/chrome-sandbox \
- && for s in 16 24 32 48 64 128 256; do \
-      install -D -m 0644 "/opt/google/chrome/product_logo_$s.png" \
-        "/usr/share/icons/hicolor/${s}x${s}/apps/google-chrome.png"; \
-    done \
- && gtk-update-icon-cache -f -t /usr/share/icons/hicolor \
- && /opt/google/chrome/google-chrome --version
+RUN set -eu; : "${TARGETARCH:=amd64}"; \
+    install -d /usr/lib/wrap; \
+    if [ "$TARGETARCH" = arm64 ]; then \
+      pacman -S --disable-sandbox --noconfirm --needed chromium; \
+      rm -rf /var/cache/pacman/pkg/*; \
+      chmod 4755 /usr/lib/chromium/chrome-sandbox; \
+      for s in 16 24 32 48 64 128 256; do \
+        src="/usr/share/icons/hicolor/${s}x${s}/apps/chromium.png"; \
+        if [ ! -f "$src" ]; then \
+          src="/usr/share/icons/hicolor/${s}x${s}/apps/chromium-browser.png"; \
+        fi; \
+        if [ -f "$src" ]; then \
+          install -D -m 0644 "$src" \
+            "/usr/share/icons/hicolor/${s}x${s}/apps/google-chrome.png"; \
+        fi; \
+      done; \
+      gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true; \
+      ln -sfn /usr/bin/chromium /usr/lib/wrap/browser; \
+    else \
+      curl -fsSL -o /tmp/chrome.deb \
+        https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb; \
+      bsdtar -xOf /tmp/chrome.deb 'data.tar.*' | bsdtar -x -C /; \
+      rm -f /tmp/chrome.deb /etc/cron.daily/google-chrome; \
+      rm -rf /opt/google/chrome/cron; \
+      ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome-stable; \
+      ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome; \
+      chmod 4755 /opt/google/chrome/chrome-sandbox; \
+      for s in 16 24 32 48 64 128 256; do \
+        install -D -m 0644 "/opt/google/chrome/product_logo_$s.png" \
+          "/usr/share/icons/hicolor/${s}x${s}/apps/google-chrome.png"; \
+      done; \
+      gtk-update-icon-cache -f -t /usr/share/icons/hicolor; \
+      ln -sfn /opt/google/chrome/google-chrome /usr/lib/wrap/browser; \
+    fi; \
+    /usr/lib/wrap/browser --version
 # (The .deb's postinst, which we skip, is what normally installs those icons;
 #  the hicolor cache must be rebuilt or GTK trusts the stale one and shows "?".)
 
@@ -241,7 +289,11 @@ RUN curl -fsSL -o /tmp/chrome.deb \
 #     profile creation — no welcome/first-run UI, no import wizard, new-tab
 #     page on startup, bookmarks bar hidden.
 # ---------------------------------------------------------------------------
+# arm64: Chromium reads its policy and initial_preferences directory from
+# /etc/chromium (Chrome's branded path is /etc/opt/chrome). One directory, two
+# names: the symlink keeps a single set of files working for both browsers.
 RUN install -d /etc/opt/chrome/policies/managed /etc/opt/chrome/policies/recommended \
+ && { [ "$TARGETARCH" != arm64 ] || ln -sfn /etc/opt/chrome /etc/chromium; } \
  && cat > /etc/opt/chrome/policies/managed/00-wrap.json <<'EOF'
 {
   "BrowserSignin": 0,
@@ -289,7 +341,7 @@ RUN install -d /etc/opt/chrome/policies/managed /etc/opt/chrome/policies/recomme
   "RemoteDebuggingAllowed": true
 }
 EOF
-RUN cat > /opt/google/chrome/initial_preferences <<'EOF'
+RUN cat > /etc/opt/chrome/initial_preferences <<'EOF'
 {
   "homepage_is_newtabpage": true,
   "browser": {
@@ -320,6 +372,10 @@ RUN cat > /opt/google/chrome/initial_preferences <<'EOF'
   }
 }
 EOF
+# Chrome looks for initial_preferences beside its binary; Chromium looks in
+# /etc/chromium, which the symlink above already points at these files.
+RUN [ "$TARGETARCH" = arm64 ] \
+ || install -D -m 0644 /etc/opt/chrome/initial_preferences /opt/google/chrome/initial_preferences
 
 # Launcher that every consumer goes through (PATH puts /usr/local/bin first,
 # so it shadows the deb's /usr/bin symlink for the .desktop entry too).
@@ -358,7 +414,7 @@ if [ "$(id -u)" = 0 ] || ! unshare --user --map-root-user --pid --net --fork tru
 fi
 set -- --disable-dev-shm-usage --no-first-run --no-default-browser-check \
        --password-store=basic --force-renderer-accessibility "$@"
-exec /opt/google/chrome/google-chrome "$@"
+exec /usr/lib/wrap/browser "$@"
 EOF
 # wrapvm: no --no-sandbox here; Chrome keeps its sandbox.
 # Chrome honors only the last --enable-features: keep both WebMCP features in
@@ -1098,7 +1154,8 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
   ~/.config/wrap-chrome. Launch flags (default: WebMCP) come
   from ~/.config/chrome-flags.conf, else /etc/wrap/chrome-flags.conf. First-run, sign-in, sync, default-browser,
   privacy-sandbox, keyring and promo prompts are disabled via managed policies in
-  /etc/opt/chrome/policies/managed and /opt/google/chrome/initial_preferences.
+  /etc/opt/chrome/policies/managed and /opt/google/chrome/initial_preferences
+  (arm64: Chromium, which reads the same files through /etc/chromium).
 - agent-browser reads $AGENT_BROWSER_CONFIG (/home/user/workspace/agent-browser.json,
   written once when missing: `{"headed": true, "autoConnect": true}`), so it
   attaches to that Chrome: `agent-browser open https://example.com` acts in the

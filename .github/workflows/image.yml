@@ -4,6 +4,11 @@ name: Image
 # the Smolfile boots. Rebuilt weekly and on demand so a new wrap base image
 # (ghcr.io/tobi/wrap:latest) reaches the VM without a commit here; tobi/wrap can
 # also send a repository_dispatch of type `base-image` after it publishes.
+#
+# amd64 is built and published. arm64 is built and tested on a native arm64
+# runner but not published: ghcr.io/tobi/wrap publishes no arm64 base, so this
+# job builds one from tobi/wrap's Containerfile.arm64 first, and the published
+# manifest would need a merge job of its own.
 on:
   push:
     branches: [main]
@@ -44,23 +49,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=wrapvm
 
       # The same checks as `make test`: wrap's desktop tests, then wrapvm's own.
-      - name: Test mise and agent-browser
-        run: docker run --rm -v "$PWD/tests:/tests:ro" localhost/wrapvm:test bash /tests/container_mise.sh desktop
-
-      - name: Test the viewer, offline
-        run: docker run --rm --network none -e MISE_OFFLINE=1 -v "$PWD/tests:/tests:ro" localhost/wrapvm:test bash /tests/container_viewer.sh
-
-      - name: Test both agent CLIs on a fresh HOME, offline
-        run: docker run --rm --network none localhost/wrapvm:test sh -lc 'd=$(mktemp -d); HOME=$d agent-browser --version >/dev/null && HOME=$d agent-desktop version >/dev/null'
-
-      - name: Test accessibility (agent-desktop)
-        run: CONTAINER_ENGINE=docker bash tests/container_a11y_run.sh localhost/wrapvm:test
-
-      - name: Test a plain detached run (CDP, viewer, SIGTERM)
-        run: CONTAINER_ENGINE=docker bash tests/container_desktop_run.sh localhost/wrapvm:test
-
-      - name: Test what wrapvm adds (ffmpeg, agent-browser config, skills)
-        run: docker run --rm -v "$PWD/tests:/tests:ro" localhost/wrapvm:test bash -l /tests/container_wrapvm.sh
+      - uses: ./.github/actions/test-image
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
@@ -95,3 +84,43 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=wrapvm
+
+  # arm64. The image's Chrome is an amd64-only .deb and dies under qemu-user
+  # emulation, so this runs natively on an arm64 runner (free for public
+  # repositories) instead of building amd64 under QEMU.
+  image-arm64:
+    runs-on: ubuntu-24.04-arm
+    env:
+      # ghcr.io/tobi/wrap publishes no arm64 base, so it is built here from
+      # tobi/wrap's Containerfile.arm64. Pinned, like WRAP's own desktop
+      # Containerfile is: a moving main must not change what this job tests.
+      WRAP_REPO: https://github.com/tobi/wrap
+      WRAP_COMMIT: c562a7d2d2dd96600641ffad4c52297ab3bb345a
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the wrap arm64 base
+        run: |
+          git clone --filter=blob:none "$WRAP_REPO" /tmp/wrap
+          git -C /tmp/wrap checkout "$WRAP_COMMIT"
+          docker buildx build --platform linux/arm64 --load \
+            -f /tmp/wrap/Containerfile.arm64 -t wrap-arm64:local /tmp/wrap
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          platforms: linux/arm64
+          load: true
+          tags: localhost/wrapvm:test
+          build-args: BASE_IMAGE=wrap-arm64:local
+          cache-from: type=gha,scope=wrapvm-arm64
+          # mode=min: this image is ~7 GB, and the amd64 job already fills the
+          # repository's GHA cache budget with mode=max.
+          cache-to: type=gha,mode=min,scope=wrapvm-arm64
+
+      # The same checks as `make test`, and as the amd64 job.
+      - uses: ./.github/actions/test-image

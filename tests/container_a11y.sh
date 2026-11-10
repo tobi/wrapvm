@@ -173,14 +173,18 @@ pids+=($!)
 page_up() { curl -fsS -o /dev/null http://127.0.0.1:8799/index.html 2>/dev/null; }
 wait_until 20 'the local page' page_up
 
-# The shared desktop Chrome: a URL handed to the running instance opens a
+# The shared desktop browser: a URL handed to the running instance opens a
 # window there, which is what the dock and agent-browser do too.
+# Google Chrome on amd64, Chromium on arm64 — AT-SPI names the app after the
+# binary, so discover it rather than assume "chrome".
 wrap-chrome http://127.0.0.1:8799/index.html >/dev/null 2>&1 || true
-chrome_listed() { agent-desktop list-apps 2>/dev/null | grep -q '"name":"chrome"'; }
-wait_until 90 'Chrome on the accessibility bus' chrome_listed
-chrome_page() { agent-desktop snapshot --app chrome -i 2>/dev/null | grep -q 'Press me'; }
-wait_until 90 "Chrome's page on the accessibility tree" chrome_page
-ok 'Chrome publishes its page (--force-renderer-accessibility)'
+chrome_listed() { agent-desktop list-apps 2>/dev/null | grep -Eq '"name":"chrom(e|ium)"'; }
+wait_until 90 'the browser on the accessibility bus' chrome_listed
+browser_app="$(agent-desktop list-apps 2>/dev/null | grep -o '"name":"chrom[^"]*"' | head -1 | cut -d'"' -f4)"
+[ -n "$browser_app" ] || die 'the browser is on the bus with no app name'
+chrome_page() { agent-desktop snapshot --app "$browser_app" -i 2>/dev/null | grep -q 'Press me'; }
+wait_until 90 "the browser's page on the accessibility tree" chrome_page
+ok 'the browser publishes its page (--force-renderer-accessibility)'
 
 ps -eo args | grep -q -- '--force-renderer-accessibility' \
   || die 'the shared Chrome did not get --force-renderer-accessibility'
@@ -253,7 +257,9 @@ ok 'accessibility comes back after the bus switches itself off (event only)'
 # --- Chrome that is restarted mid-session is readable, once -----------------
 # Chrome decides at start whether to publish, so a restarted browser has to end
 # up on the tree again, with exactly one window to resolve.
-chrome_pid() { ps -eo pid,args | awk '/opt\/google\/chrome\/chrome --disable-dev-shm/ && !/awk/ {print $1; exit}'; }
+# The main browser process, whichever build is installed: Google Chrome's binary
+# on amd64, Chromium's on arm64.
+chrome_pid() { ps -eo pid,args | awk '/(\/opt\/google\/chrome\/chrome|\/usr\/lib\/chromium\/chromium) --disable-dev-shm/ && !/awk/ {print $1; exit}'; }
 dead_chrome="$(chrome_pid)"
 [ -n "$dead_chrome" ] || die 'no Chrome browser process before the restart'
 kill "$dead_chrome"
@@ -263,11 +269,11 @@ wrap-desktop start --quiet || die 'wrap-desktop start failed after the Chrome re
 wait_until 90 'CDP after the Chrome restart' chrome_up
 wrap-chrome http://127.0.0.1:8799/index.html >/dev/null 2>&1 || true
 wait_until 90 "Chrome's page on the tree after the restart" chrome_page
-windows="$(agent-desktop list-windows 2>/dev/null | tr '{' '\n' | grep -c '"app_name":"chrome"')"
-[ "$windows" = 1 ] || die "expected one Chrome window after the restart, found $windows"
-agent-desktop snapshot --app chrome -i 2>/dev/null | grep -q 'Press me' \
-  || die 'Chrome is not readable after the restart'
-ok 'Chrome restarted mid-session is on the tree again, with one window'
+windows="$(agent-desktop list-windows 2>/dev/null | tr '{' '\n' | grep -c "\"app_name\":\"$browser_app\"")"
+[ "$windows" = 1 ] || die "expected one browser window after the restart, found $windows"
+agent-desktop snapshot --app "$browser_app" -i 2>/dev/null | grep -q 'Press me' \
+  || die 'the browser is not readable after the restart'
+ok 'the browser restarted mid-session is on the tree again, with one window'
 
 # --- root's login shell must not take the bus over --------------------------
 # `sudo -i` runs the image's login profile, which runs `wrap-desktop start` as
