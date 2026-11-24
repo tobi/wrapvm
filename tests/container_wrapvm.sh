@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run inside a fresh, disposable wrapvm container, as the image's user, in a
-# login shell: what wrapvm adds to wrap's desktop.
+# login shell: wrapvm desktop integration checks.
 #   podman run --rm -v "$PWD/tests:/tests:ro" localhost/wrapvm:test bash -l /tests/container_wrapvm.sh
 set -euo pipefail
 ok() { printf 'ok - %s\n' "$*"; }

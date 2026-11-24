@@ -1,7 +1,11 @@
 CONTAINER_ENGINE ?= podman
 IMAGE ?= localhost/wrapvm:test
+BUILD_FLAGS ?= --pull
 
-.PHONY: image test image.tar check-engine
+.PHONY: check image base-image test test-base image.tar check-engine
+
+check:
+	bash tests/source_standalone.sh
 
 # The Containerfile writes its scripts with RUN heredocs. Docker's legacy
 # builder (no buildx/BuildKit) accepts them but writes empty files.
@@ -12,11 +16,17 @@ check-engine:
 	  exit 1; \
 	fi
 
-image: check-engine
-	$(CONTAINER_ENGINE) build --pull -t $(IMAGE) -f Containerfile .
+image: check check-engine
+	$(CONTAINER_ENGINE) build $(BUILD_FLAGS) -t $(IMAGE) -f Containerfile .
 
-# wrap's desktop tests (tests/container_{mise,viewer,a11y,desktop}*, from
-# tobi/wrap), then what wrapvm adds. Needs egress; every container is disposable.
+base-image: check check-engine
+	$(CONTAINER_ENGINE) build $(BUILD_FLAGS) --target base -t $(IMAGE)-base -f Containerfile .
+
+test-base: base-image
+	$(CONTAINER_ENGINE) run --rm -v "$(CURDIR)/tests:/tests:ro" $(IMAGE)-base bash /tests/container_mise.sh base
+
+# Desktop, viewer, accessibility and integration tests. Needs egress;
+# every container is disposable.
 test: image
 	$(CONTAINER_ENGINE) run --rm -v "$(CURDIR)/tests:/tests:ro" $(IMAGE) bash /tests/container_mise.sh desktop
 	$(CONTAINER_ENGINE) run --rm --network none -e MISE_OFFLINE=1 -v "$(CURDIR)/tests:/tests:ro" $(IMAGE) bash /tests/container_viewer.sh

@@ -1,9 +1,8 @@
 name: Image
 
 # Builds ./Containerfile, tests it, and publishes ghcr.io/<owner>/wrapvm, which
-# the Smolfile boots. Rebuilt weekly and on demand so a new wrap base image
-# (ghcr.io/tobi/wrap:latest) reaches the VM without a commit here; tobi/wrap can
-# also send a repository_dispatch of type `base-image` after it publishes.
+# the Smolfile boots. Rebuilt weekly and on demand for Arch and tool updates.
+# The base toolchain is built here, not pulled from another project.
 on:
   push:
     branches: [main]
@@ -12,8 +11,6 @@ on:
   schedule:
     - cron: '17 5 * * 1'
   workflow_dispatch:
-  repository_dispatch:
-    types: [base-image]
 
 permissions:
   contents: read
@@ -32,6 +29,24 @@ jobs:
       # Docker's legacy builder turns into empty files.
       - uses: docker/setup-buildx-action@v3
 
+      - name: Check standalone source
+        run: make check
+
+      - name: Build base toolchain
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          target: base
+          load: true
+          pull: true
+          tags: localhost/wrapvm:base-test
+          cache-from: type=gha,scope=wrapvm
+          cache-to: type=gha,mode=max,scope=wrapvm
+
+      - name: Test base toolchain
+        run: docker run --rm -v "$PWD/tests:/tests:ro" localhost/wrapvm:base-test bash /tests/container_mise.sh base
+
       - name: Build
         uses: docker/build-push-action@v6
         with:
@@ -43,7 +58,7 @@ jobs:
           cache-from: type=gha,scope=wrapvm
           cache-to: type=gha,mode=max,scope=wrapvm
 
-      # The same checks as `make test`: wrap's desktop tests, then wrapvm's own.
+      # The same desktop checks as `make test`.
       - name: Test mise and agent-browser
         run: docker run --rm -v "$PWD/tests:/tests:ro" localhost/wrapvm:test bash /tests/container_mise.sh desktop
 
@@ -59,7 +74,7 @@ jobs:
       - name: Test a plain detached run (CDP, viewer, SIGTERM)
         run: CONTAINER_ENGINE=docker bash tests/container_desktop_run.sh localhost/wrapvm:test
 
-      - name: Test what wrapvm adds (ffmpeg, agent-browser config, skills)
+      - name: Test desktop integration (ffmpeg, agent-browser config, skills)
         run: docker run --rm -v "$PWD/tests:/tests:ro" localhost/wrapvm:test bash -l /tests/container_wrapvm.sh
 
       - name: Log in to GitHub Container Registry

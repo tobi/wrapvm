@@ -1,8 +1,10 @@
-# wrapvm: tobi/wrap's desktop (Containerfile.desktop at c562a7d) plus ffmpeg and
-# a workspace agent-browser config. This file is the one definition of the VM:
-# CI publishes it as ghcr.io/tobi/wrapvm:desktop, which the Smolfile boots.
+# syntax=docker/dockerfile:1
+# wrapvm owns the full image: Arch bootstrap + toolchain + desktop + viewer.
+# No wrap image, CLI or checkout is required. Guest /opt/wrap paths and WRAP_*
+# variables are retained as a compatibility API for Rune and existing machines.
+# CI publishes ghcr.io/tobi/wrapvm:desktop; Smolfile boots that image.
 #
-# wrap desktop: base image + a headless X desktop (Xvfb + XFCE), one persistent
+# Desktop: base image + a headless X desktop (Xvfb + XFCE), one persistent
 # Google Chrome on that desktop with CDP on localhost:9222 and every first-run/
 # setup prompt suppressed system-wide, and agent-browser preconfigured to attach
 # to that Chrome — so a human (in the browser viewer) and the agent share the
@@ -18,7 +20,308 @@
 # and refuses other sites' pages. Chrome only binds CDP to 127.0.0.1:9222 (it
 # ignores --remote-debugging-address with a window), so a socat forwarder serves
 # it on all guest interfaces at :9223.
-ARG BASE_IMAGE=ghcr.io/tobi/wrap:latest
+ARG BASE_IMAGE=archlinux:latest
+FROM ${BASE_IMAGE} AS base
+ARG TARGETARCH
+# Optional build-only workaround for Docker hosts whose seccomp blocks Landlock.
+# Guest pacman defaults and package signature verification remain unchanged.
+ARG PACMAN_FLAGS=
+# Arch Linux ARM has no mise package; pin its official native release instead.
+ARG MISE_VERSION=2026.11.13
+ARG MISE_ARM64_SHA256=f9d7ddfe1e87b9d8095d8845449a1c2de3309cb222a06c2e46bc3887f14a258c
+
+# ---------------------------------------------------------------------------
+# Toolchain lives at absolute paths under /opt, NOT under $HOME.
+#
+# Rationale: mise resolves its config/data/cache/shims relative to `~` by
+# default, which hard-wires the whole toolchain to /root. That breaks two real
+# use cases:
+#   1. Running the container as a non-root uid (e.g. podman --userns=keep-id):
+#      /root is 0750, so uid!=0 cannot even traverse it to reach the shims.
+#   2. Overriding HOME (e.g. HOME=/workspace/.sandbox-home): mise then looks for
+#      its config/installs under the new HOME, finds nothing, and every shim
+#      fails with "<tool> is not a valid shim".
+#
+# Pinning MISE_* to absolute paths decouples the toolchain from $HOME entirely,
+# so HOME is free to be whatever the caller wants.
+#
+# DATA/CONFIG are shared state under /opt, owned by `user` (installs work
+# without sudo) and world-readable (root can still run the shims).
+# The desktop stage pins CACHE/STATE per uid, independently of HOME, so bots
+# share install locks without letting root poison the user's cache or state.
+#
+# MISE_TRUSTED_CONFIG_PATHS is required, not cosmetic: mise only auto-trusts a
+# global config it resolves through $HOME. With the config at an absolute path
+# outside HOME, an overridden HOME makes mise silently list it under
+# `ignored_config_files` and every shim fails with "No version is set for
+# shim: <tool>". Declaring the path trusted keeps the toolchain working for any
+# HOME value.
+# ---------------------------------------------------------------------------
+ENV MISE_DATA_DIR=/opt/mise/data \
+    MISE_CONFIG_DIR=/opt/mise/config \
+    MISE_TRUSTED_CONFIG_PATHS=/opt/mise/config
+
+# Build-time identity only; the runtime identity is set at the end of the file.
+ENV HOME=/root \
+    USER=root \
+    PATH=/usr/local/bin:/opt/mise/data/shims:/opt/wrap/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
+    STARSHIP_CONFIG=/etc/wrap/starship.toml
+
+# Unprivileged identity. uid/gid 1000 matches the common single-user host uid,
+# so bind-mounted files map 1:1 under `--userns=keep-id` without chowning.
+ENV WRAP_UID=1000 \
+    WRAP_GID=1000 \
+    WRAP_USER_NAME=user \
+    WRAP_USER_HOME=/home/user
+
+# Keep signature verification enabled on both distributions. The ARM bootstrap
+# is an independently signature-verified official Arch Linux ARM rootfs.
+RUN case "${TARGETARCH:-$(uname -m)}" in \
+      arm64|aarch64) keyring=archlinuxarm; mise_package=; \
+        printf '%s\n' 'Server = https://de3.mirror.archlinuxarm.org/$arch/$repo' > /etc/pacman.d/mirrorlist; \
+        passwd -l root; userdel -r alarm ;; \
+      amd64|x86_64) keyring=archlinux; mise_package=mise; \
+        printf '%s\n' 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist ;; \
+      *) echo "unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+ && pacman-key --init \
+ && pacman-key --populate "$keyring" \
+ && pacman ${PACMAN_FLAGS} -Sy --noconfirm "$keyring-keyring" \
+ && pacman ${PACMAN_FLAGS} -Syu --noconfirm \
+      base-devel \
+      ca-certificates \
+      clang \
+      cmake \
+      curl \
+      eza \
+      fd \
+      gdb \
+      git \
+      github-cli \
+      gnupg \
+      jq \
+      libyaml \
+      ${mise_package} \
+      nano \
+      ninja \
+      openssh \
+      python \
+      ripgrep \
+      ruby \
+      sudo \
+      tar \
+      unzip \
+      util-linux \
+      which \
+      zsh \
+      starship \
+ && if [ "$keyring" = archlinuxarm ]; then \
+      curl -fL -o /tmp/mise.tar.xz "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-arm64.tar.xz" \
+      && printf '%s  %s\n' "$MISE_ARM64_SHA256" /tmp/mise.tar.xz | sha256sum -c - \
+      && tar -xJf /tmp/mise.tar.xz -C /tmp \
+      && install -m 0755 /tmp/mise/bin/mise /usr/bin/mise \
+      && rm -rf /tmp/mise /tmp/mise.tar.xz; \
+    fi \
+ && install -d /opt/mise/config/conf.d /opt/wrap/bin /etc/wrap \
+ && if ! grep -qx '/bin/zsh' /etc/shells; then echo /bin/zsh >> /etc/shells; fi \
+ && if ! grep -qx '/usr/bin/zsh' /etc/shells; then echo /usr/bin/zsh >> /etc/shells; fi \
+ && (chsh -s /bin/zsh root || true) \
+ && rm -rf /var/cache/pacman/pkg/*
+
+# Declare tools without downloading them. reshim creates mise's bootstrap
+# commands; first use installs just the requested tool, later uses auto-update.
+# mise comes from pacman on amd64, or the checksum-pinned native release on ARM.
+COPY resources/mise.toml /opt/mise/config/config.toml
+RUN mise reshim
+
+# ---------------------------------------------------------------------------
+# Unprivileged `user` (uid/gid 1000) with passwordless sudo.
+# The project bind-mounts at ${WRAP_USER_HOME}/workspace, owned by that uid
+# so it is writable in user mode without any host-side chown.
+# /opt/mise is owned by that uid too: the toolchain lives at a HOME-independent
+# path, but `user` must be able to `mise use`/`mise install` into it without
+# sudo. root still reads it fine (a+rX).
+# ---------------------------------------------------------------------------
+RUN groupadd -g "${WRAP_GID}" "${WRAP_USER_NAME}" 2>/dev/null || true \
+ && useradd -m -d "${WRAP_USER_HOME}" -u "${WRAP_UID}" -g "${WRAP_GID}" \
+      -s /bin/zsh "${WRAP_USER_NAME}" 2>/dev/null || true \
+ && usermod -aG wheel "${WRAP_USER_NAME}" \
+ && printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "${WRAP_USER_NAME}" \
+      > /etc/sudoers.d/10-wrap-user \
+ && printf '%%wheel ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/11-wrap-wheel \
+ && chmod 0440 /etc/sudoers.d/10-wrap-user /etc/sudoers.d/11-wrap-wheel \
+ && visudo -c \
+ && install -d -o "${WRAP_UID}" -g "${WRAP_GID}" "${WRAP_USER_HOME}/workspace" \
+ && chown -R "${WRAP_UID}:${WRAP_GID}" "${WRAP_USER_HOME}" /opt/mise \
+ && chmod 0755 "${WRAP_USER_HOME}"
+
+# ---------------------------------------------------------------------------
+# Shell environment. MISE_* and PATH are re-exported here so they survive
+# `su`, `sudo -i`, and login shells that reset the environment. One file,
+# sourced by /etc/profile (sh/bash login) and /etc/zsh/zshenv (every zsh).
+# The PATH prepend is idempotent so nested shells do not stack duplicates.
+# ---------------------------------------------------------------------------
+RUN cat > /etc/profile.d/wrap.sh <<'EOF'
+export MISE_DATA_DIR=/opt/mise/data
+export MISE_CONFIG_DIR=/opt/mise/config
+export MISE_TRUSTED_CONFIG_PATHS="${MISE_TRUSTED_CONFIG_PATHS:-/opt/mise/config}"
+export STARSHIP_CONFIG=/etc/wrap/starship.toml
+case ":$PATH:" in
+  *":/opt/mise/data/shims:"*) ;;
+  *) export PATH="/usr/local/bin:/opt/mise/data/shims:/opt/wrap/bin:$PATH" ;;
+esac
+EOF
+
+RUN cat > /etc/zsh/zshenv <<'EOF'
+[ -f /etc/profile.d/wrap.sh ] && . /etc/profile.d/wrap.sh
+if [[ -o interactive && -t 1 ]]; then
+  eval "$(/usr/bin/mise activate zsh)"
+  eval "$(starship init zsh)"
+fi
+EOF
+
+# Skeleton dotfiles, installed for BOTH root and user so either mode gets the
+# same shell. Kept minimal and identity-free: git author/committer values come
+# from the environment, never baked into the image.
+RUN cat > /etc/wrap/skel.zshrc <<'EOF'
+# wrap interactive shell
+setopt HIST_IGNORE_DUPS SHARE_HISTORY INC_APPEND_HISTORY
+HISTSIZE=10000
+SAVEHIST=10000
+HISTFILE="${XDG_STATE_HOME:-$HOME/.local/state}/zsh_history"
+mkdir -p "$(dirname "$HISTFILE")" 2>/dev/null || true
+
+autoload -Uz compinit && compinit -u 2>/dev/null || true
+
+alias ls='eza --group-directories-first'
+alias ll='eza -l --git --group-directories-first'
+alias la='eza -la --git --group-directories-first'
+alias g=git
+EOF
+
+RUN cat > /etc/wrap/skel.profile <<'EOF'
+# wrap login shell (sh/bash compatible)
+[ -f /etc/profile.d/wrap.sh ] && . /etc/profile.d/wrap.sh
+EOF
+
+# `safe.directory = *` is deliberate: the project is a bind mount whose host
+# owner uid frequently differs from the in-container uid, and git otherwise
+# aborts every command with "detected dubious ownership in repository".
+RUN cat > /etc/wrap/skel.gitconfig <<'EOF'
+[safe]
+	directory = *
+[init]
+	defaultBranch = main
+[advice]
+	detachedHead = false
+EOF
+
+RUN set -eu; \
+    for target in /root "${WRAP_USER_HOME}"; do \
+      install -d "$target"; \
+      cp /etc/wrap/skel.zshrc     "$target/.zshrc"; \
+      cp /etc/wrap/skel.profile   "$target/.profile"; \
+      cp /etc/wrap/skel.profile   "$target/.zprofile"; \
+      cp /etc/wrap/skel.profile   "$target/.bashrc"; \
+      cp /etc/wrap/skel.gitconfig "$target/.gitconfig"; \
+      install -d "$target/.local/state" "$target/.config" "$target/.cache"; \
+    done; \
+    chown -R "${WRAP_UID}:${WRAP_GID}" "${WRAP_USER_HOME}"; \
+    cp /etc/wrap/skel.zshrc /etc/skel/.zshrc; \
+    cp /etc/wrap/skel.profile /etc/skel/.profile; \
+    cp /etc/wrap/skel.gitconfig /etc/skel/.gitconfig
+
+RUN cat > /etc/wrap/starship.toml <<'EOF'
+add_newline = true
+command_timeout = 200
+format = "$hostname$directory$git_branch$git_status$character"
+right_format = "$cmd_duration"
+
+[hostname]
+ssh_only = false
+trim_at = ""
+format = "[\\[container:$hostname\\]](bold #c4a7e7) "
+
+[character]
+success_symbol = "[❯](bold #89ddff)"
+error_symbol = "[✗](bold #f78c6c)"
+
+[directory]
+truncation_length = 2
+truncation_symbol = "…/"
+repo_root_style = "bold #89ddff"
+repo_root_format = "[$repo_root]($repo_root_style)[$path]($style)[$read_only]($read_only_style) "
+
+[git_branch]
+format = "[$branch]($style) "
+style = "italic #c4a7e7"
+
+[git_status]
+format = "[$all_status]($style)"
+style = "#89ddff"
+ahead = "⇡${count} "
+diverged = "⇕⇡${ahead_count}⇣${behind_count} "
+behind = "⇣${count} "
+conflicted = "! "
+up_to_date = ""
+untracked = "? "
+modified = "~ "
+stashed = ""
+staged = ""
+renamed = ""
+deleted = ""
+
+[cmd_duration]
+min_time = 2000
+format = "[· $duration](#78909c)"
+EOF
+
+# ---------------------------------------------------------------------------
+# Entrypoint: the workload always runs as the unprivileged `user`.
+#
+#   default / started as root   -> setpriv to uid/gid 1000, HOME=/home/user
+#   --user <uid>                -> runs as that uid; HOME is corrected because
+#                                  a bare --user would otherwise inherit an
+#                                  unusable HOME.
+#
+# There is no root mode. Need root inside? `sudo -i` (passwordless) or
+# `docker exec -u root`.
+#
+# BIND MOUNTS + ROOTLESS PODMAN: container uid 1000 maps into the *subuid*
+# range, so a host directory owned by the host user is not writable from the
+# default identity. Pass `--userns=keep-id` (container uid == host uid).
+# Under docker or rootful podman, uid 1000 writes as host uid 1000 directly.
+# ---------------------------------------------------------------------------
+RUN cat > /opt/wrap/bin/wrap-entrypoint <<'EOF'
+#!/bin/sh
+set -eu
+
+: "${WRAP_USER_NAME:=user}"
+: "${WRAP_USER_HOME:=/home/user}"
+: "${WRAP_UID:=1000}"
+: "${WRAP_GID:=1000}"
+
+export HOME="$WRAP_USER_HOME"
+export USER="$WRAP_USER_NAME"
+
+if [ "$(id -u)" = "0" ]; then
+  exec setpriv --reuid="$WRAP_UID" --regid="$WRAP_GID" --init-groups -- "$@"
+fi
+exec "$@"
+EOF
+RUN chmod 0755 /opt/wrap/bin/wrap-entrypoint
+
+# Image defaults describe the identity the workload actually runs as.
+# ~/.local/bin is where curl-installed agent CLIs (cursor-agent, claude) land;
+# appended so non-login processes (docker exec, daemons) find them without
+# letting them shadow system commands.
+ENV HOME=/home/user \
+    USER=user \
+    PATH=${PATH}:/home/user/.local/bin
+
+WORKDIR /home/user/workspace
+ENTRYPOINT ["/opt/wrap/bin/wrap-entrypoint"]
+CMD ["/bin/zsh", "-l"]
 
 # ---------------------------------------------------------------------------
 # voxl (github.com/tembo/voxl) is the viewer: it streams :1 to a browser as
@@ -28,11 +331,12 @@ ARG BASE_IMAGE=ghcr.io/tobi/wrap:latest
 # and the image installs the four libraries it links (x264, libyuv, opus,
 # libpulse). Everything else here — Rust, esbuild, the crates — stays behind.
 # ---------------------------------------------------------------------------
-FROM ${BASE_IMAGE} AS voxl
+FROM base AS voxl
+ARG PACMAN_FLAGS=
 # The base puts mise's shims first on PATH, and cargo there is a lazy install.
 # Arch's own rust is the toolchain here.
 ENV HOME=/root USER=root CARGO_HOME=/tmp/cargo PATH=/usr/bin:/bin
-RUN pacman -Syu --noconfirm --needed rust esbuild x264 libyuv opus libpulse \
+RUN pacman ${PACMAN_FLAGS} -Syu --noconfirm --needed rust esbuild x264 libyuv opus libpulse \
  && rm -rf /var/cache/pacman/pkg/*
 # Arch's libyuv ships no pkg-config file, and voxl's build.rs asks pkg-config
 # for every library it links.
@@ -68,7 +372,9 @@ RUN sed -i 's/^bindgen = "0.71"$/bindgen = "0.72"/' Cargo.toml \
  && strip /opt/voxl/bin/voxl \
  && /opt/voxl/bin/voxl --version
 
-FROM ${BASE_IMAGE}
+FROM base AS desktop
+ARG TARGETARCH
+ARG PACMAN_FLAGS=
 
 # Build steps run as root; keep root's droppings out of the user's home. The
 # runtime identity (HOME=/home/user) is restored at the end of the file.
@@ -103,7 +409,7 @@ ENV DISPLAY=:1 \
 # wrapvm: pulseaudio is the desktop's sound card, a null sink that voxl streams
 # to the viewer; pulseaudio-alsa routes ALSA's default device into it.
 # ---------------------------------------------------------------------------
-RUN pacman -Syu --noconfirm --needed \
+RUN pacman ${PACMAN_FLAGS} -Syu --noconfirm --needed \
       xorg-server-xvfb xorg-xauth xorg-xdpyinfo xorg-xset xorg-xrandr xdotool \
       scrot socat x264 libyuv opus libpulse \
       dbus xfce4-session xfwm4 xfdesktop xfce4-panel xfce4-settings xfconf \
@@ -113,6 +419,7 @@ RUN pacman -Syu --noconfirm --needed \
       libxrandr libxcomposite libxdamage libxkbcommon libdrm mesa pango cairo \
       libxshmfence vulkan-icd-loader \
       ffmpeg pulseaudio pulseaudio-alsa \
+ && if [ ! -s /etc/machine-id ]; then dbus-uuidgen > /etc/machine-id; fi \
  && dbus-uuidgen --ensure=/etc/machine-id \
  && rm -rf /var/cache/pacman/pkg/*
 
@@ -212,8 +519,13 @@ RUN LD_BIND_NOW=1 voxl --version
 # same thing). No dpkg needed: bsdtar unpacks data.tar.* onto /. Cron/apt
 # repo hooks from the package are dropped.
 # ---------------------------------------------------------------------------
-RUN curl -fsSL -o /tmp/chrome.deb \
-      https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+RUN case "${TARGETARCH:-$(uname -m)}" in \
+      amd64|x86_64) chrome_arch=amd64 ;; \
+      arm64|aarch64) chrome_arch=arm64 ;; \
+      *) echo "unsupported Chrome architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/chrome.deb \
+      "https://dl.google.com/linux/direct/google-chrome-stable_current_${chrome_arch}.deb" \
  && bsdtar -xOf /tmp/chrome.deb 'data.tar.*' | bsdtar -x -C / \
  && rm -f /tmp/chrome.deb /etc/cron.daily/google-chrome \
  && rm -rf /opt/google/chrome/cron \
@@ -1067,7 +1379,7 @@ EOF
 RUN chmod 0755 /opt/wrap/bin/wrap-desktop \
  && install -d -m 1777 /var/lib/wrap-desktop
 
-# Autostart from login shells (wrap enters every session via `zsh -l`; docker
+# Autostart from login shells (the launcher enters via `zsh -l`; docker
 # `-it` shells too). /etc/profile sources profile.d for sh/bash, and Arch's
 # /etc/zsh/zprofile sources /etc/profile. Idempotent: ~1s once, instant after.
 RUN cat > /etc/profile.d/wrap-desktop.sh <<'EOF'
@@ -1085,7 +1397,7 @@ EOF
 
 # Short operator/agent note about what is wired up.
 RUN cat > /etc/wrap/desktop.md <<'EOF'
-# wrap desktop
+# wrapvm desktop
 
 - X display `:1` (Xvfb, 1280x800) running XFCE. Autostarts from login shells;
   `wrap-desktop start|stop|status|url|password|screenshot [FILE]` (screenshot =
@@ -1132,8 +1444,7 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
   screenshot --screen 0`) cannot see the real windows. A window that is covered
   therefore cannot be captured on its own; capture the screen instead.
 - View: voxl, a browser viewer (H.264 over a WebSocket), on :6080 through the
-  VM's published ports (wrap: `network.ports: [6080]`; the host side is
-  loopback). `wrap-desktop url` prints the sign-in link,
+  VM's published ports (`./wrapvm` publishes host loopback6080 to guest6080). `wrap-desktop url` prints the sign-in link,
   http://127.0.0.1:6080/?token=<password>. The password is WRAP_DESKTOP_PASSWORD,
   else /var/lib/wrap-desktop/<uid>/password (made up on the first start, kept
   after; `wrap-desktop password` prints it).
